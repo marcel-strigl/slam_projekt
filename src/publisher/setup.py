@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'slam_features'
+package_name = 'publisher'
 
 setup(
     name=package_name,
@@ -24,13 +24,6 @@ setup(
     },
     entry_points={
         'console_scripts': [
-        'orb = slam_features.orb:main',
-        'bf_matcher = slam_features.bf_matcher:main',
-        'bf_depth = slam_features.bf_depth:main',
-        'comb_matcher = slam_features.comb_matcher:main',
-        'PointCloud = slam_features.PointCloud:main',
-        'ORB_finder = slam_features.ORB_finder:main',
-        'kabsch = slam_features.kabsch:main'
         ],
-    }
+    },
 )
