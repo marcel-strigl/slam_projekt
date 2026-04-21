@@ -10,6 +10,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image, PointCloud2
 from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Header
+from nav_msgs.msg import Odometry
 
 
 class ImageSubscriber(Node):
@@ -18,11 +19,20 @@ class ImageSubscriber(Node):
 
         self.bridge = CvBridge()
 
+        self.P_inliers = []
+
         # Kamera-Parameter
         self.cx = 318.525
         self.cy = 241.181
         self.fx = 526.61
         self.fy = 526.61
+
+        #Wheel Odom
+        self.real_x = 0.0
+        self.real_y = 0.0
+        self.trans_x = 0.0
+        self.trans_y = 0.0
+        self.vektor = []
 
         # Vorherige Fames
         self.prev_gray = None
@@ -43,11 +53,27 @@ class ImageSubscriber(Node):
         # Topics Subscriben
         self.subscription_rgb = self.create_subscription(Image,'/serf01/nav_rgbd_1/rgb/image_raw',self.rgb_callback,10)
         self.subscription_depth = self.create_subscription(Image,'/serf01/nav_rgbd_1/depth/image_raw',self.depth_callback,10)
+        self.subscription_wheel_odom = self.create_subscription(Odometry,'/wheel_odom/pose',self.odom_callback,10)
 
         # Ausgeben der Punktewolken
         self.prev_point_cloud_publisher = self.create_publisher(PointCloud2, '/orb_feature_cloud_prev', 10)
         self.current_point_cloud_publisher = self.create_publisher(PointCloud2, '/orb_feature_cloud_curr', 10)
-        self.current_point_cloud_trans = self.create_publisher(PointCloud2, '/orb_feature_cloud_curr_aligned', 10)
+
+    def odom_callback(self, msg):
+        self.real_x = msg.pose.position.x
+        self.real_y = msg.pose.position.y
+
+        if self.trans_x == 0.0 and self.trans_y == 0.0:
+            self.trans_x = self.real_x
+            self.trans_y = self.real_y
+
+        dx = self.real_x - self.trans_x
+        dy = self.real_y - self.trans_y
+
+        R = self.rotation_matrix_2d(math.pi / 4)
+
+        self.vektor = np.array([dx, dy], dtype=np.float64)
+        self.vektor = R @ self.vektor
 
     def depth_callback(self, msg):
         self.depth_img = self.bridge.imgmsg_to_cv2(msg, 'passthrough')/1000.0
@@ -83,8 +109,6 @@ class ImageSubscriber(Node):
 
         # Nur die besten 100?  Matches verwenden
         matches = sorted(matches, key=lambda x: x.distance)
-        best_matches = min(500, len(matches))
-        matches = matches[:best_matches]
 
         # Korrespondierende 3D-Punkte aufbauen
         prev_points_2d = []   # P vorherig
@@ -93,12 +117,12 @@ class ImageSubscriber(Node):
         prev_points_3d = []
         curr_points_3d = []
 
-        img_h = 480
-        img_w = 640
-
         img_out = frame.copy()
 
         for m in matches:
+            
+            if m.distance  > 20.0: break
+
             kp_c = kp_curr[m.queryIdx]   # aktuelles Bild
             kp_p = kp_prev[m.trainIdx]   # vorheriges Bild
 
@@ -107,6 +131,7 @@ class ImageSubscriber(Node):
 
             u_ci, v_ci = int(round(u_c)), int(round(v_c))
             u_pi, v_pi = int(round(u_p)), int(round(v_p))
+
 
             z_curr = self.depth_img[v_ci, u_ci]
             z_prev = self.prev_depth_img[v_pi, u_pi]
@@ -117,11 +142,11 @@ class ImageSubscriber(Node):
 
             # 3D-Punkte im Kamerakoordinatensystem
             x_curr = -z_curr * (u_c - self.cx) / self.fx
-            y_curr = 0.0
+            y_curr = -z_curr * (v_c - self.cy) / self.fy
             zc_curr = z_curr
 
             x_prev = -z_prev * (u_p - self.cx) / self.fx
-            y_prev = 0.0
+            y_prev = -z_prev * (v_p - self.cy) / self.fy
             zc_prev = z_prev
 
             # 2D für Kabsch: Ebene = (z, x)
@@ -169,25 +194,18 @@ class ImageSubscriber(Node):
 
         # Pose integrieren
         self.robot_theta += theta_robot
-
-        c = math.cos(self.robot_theta)
-        s = math.sin(self.robot_theta)
+        c = math.cos(self.robot_theta + 3.14)
+        s = math.sin(self.robot_theta + 3.14)
         R_world = np.array([[c, -s], [s, c]], dtype=np.float64)
 
         delta_world = R_world @ t_robot
         self.robot_x += delta_world[0]
         self.robot_y += delta_world[1]
 
-
         #Debug ausgabe
-        self.get_logger().info(f"x: {self.robot_x:.2f}, y: {self.robot_y:.2f}, theta: {math.degrees(self.robot_theta):.1f}°")
+        self.get_logger().info(f"-: {self.robot_x:.2f}, y: {self.robot_y:.2f}, theta: {math.degrees(self.robot_theta):.1f}°")
 
-        # Aktuelle Punktwolke ins alte System transformieren
-        curr_points_aligned = []
-        for q in curr_points_3d[inlier_mask]:
-            q2 = np.array([q[0], q[1]], dtype=np.float64)   # [z, x]
-            p_est = R_pc @ q2 + t_pc
-            curr_points_aligned.append([float(p_est[0]), float(p_est[1]), 0.0])
+        print("X: ", self.vektor[0], "      Y: ", self.vektor[1])
 
         prev_points_inliers_3d = prev_points_3d[inlier_mask]
         curr_points_inliers_3d = curr_points_3d[inlier_mask]
@@ -198,16 +216,13 @@ class ImageSubscriber(Node):
         header.frame_id = "kinect_depth"
 
         if len(prev_points_inliers_3d) > 0:
-            msg_prev = point_cloud2.create_cloud_xyz32(header, prev_points_inliers_3d.tolist())
+            msg_prev = point_cloud2.create_cloud_xyz32(header, curr_points_3d.tolist())
             self.prev_point_cloud_publisher.publish(msg_prev)
 
         if len(curr_points_inliers_3d) > 0:
             msg_curr = point_cloud2.create_cloud_xyz32(header, curr_points_inliers_3d.tolist())
             self.current_point_cloud_publisher.publish(msg_curr)
 
-        if len(curr_points_aligned) > 0:
-            msg_aligned = point_cloud2.create_cloud_xyz32(header, curr_points_aligned)
-            self.current_point_cloud_trans.publish(msg_aligned)
 
         cv2.imshow("Matches", img_out)
         cv2.waitKey(1)
@@ -275,6 +290,7 @@ class ImageSubscriber(Node):
             if inlier_count > best_inlier_count:
                 best_inlier_count = inlier_count
                 best_inlier_mask = inlier_mask
+
         
 
         if best_inlier_mask is None or best_inlier_count < 3:
