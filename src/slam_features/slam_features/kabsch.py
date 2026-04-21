@@ -50,7 +50,7 @@ class ImageSubscriber(Node):
         self.current_point_cloud_trans = self.create_publisher(PointCloud2, '/orb_feature_cloud_curr_aligned', 10)
 
     def depth_callback(self, msg):
-        self.depth_img = self.bridge.imgmsg_to_cv2(msg, 'passthrough')
+        self.depth_img = self.bridge.imgmsg_to_cv2(msg, 'passthrough')/1000.0
 
     def rgb_callback(self, msg):
         frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
@@ -83,7 +83,7 @@ class ImageSubscriber(Node):
 
         # Nur die besten 100?  Matches verwenden
         matches = sorted(matches, key=lambda x: x.distance)
-        best_matches = min(100, len(matches))
+        best_matches = min(500, len(matches))
         matches = matches[:best_matches]
 
         # Korrespondierende 3D-Punkte aufbauen
@@ -97,7 +97,7 @@ class ImageSubscriber(Node):
         img_w = 640
 
         img_out = frame.copy()
-#############################################################################################################################
+
         for m in matches:
             kp_c = kp_curr[m.queryIdx]   # aktuelles Bild
             kp_p = kp_prev[m.trainIdx]   # vorheriges Bild
@@ -108,25 +108,9 @@ class ImageSubscriber(Node):
             u_ci, v_ci = int(round(u_c)), int(round(v_c))
             u_pi, v_pi = int(round(u_p)), int(round(v_p))
 
-            if not (0 <= u_ci < img_w and 0 <= v_ci < img_h):
-                continue
-            if not (0 <= u_pi < img_w and 0 <= v_pi < img_h):
-                continue
+            z_curr = self.depth_img[v_ci, u_ci]
+            z_prev = self.prev_depth_img[v_pi, u_pi]
 
-            d_curr = self.depth_img[v_ci, u_ci]
-            d_prev = self.prev_depth_img[v_pi, u_pi]
-
-            if not self.is_valid_depth(d_curr) or not self.is_valid_depth(d_prev):
-                continue
-
-            # optional: lokale Tiefenstabilität
-            if not self.is_depth_locally_stable(self.depth_img, u_ci, v_ci):
-                continue
-            if not self.is_depth_locally_stable(self.prev_depth_img, u_pi, v_pi):
-                continue
-
-            z_curr = float(d_curr) / 1000.0
-            z_prev = float(d_prev) / 1000.0
 
             if not (0.2 <= z_curr <= 20.0 and 0.2 <= z_prev <= 20.0):
                 continue
@@ -144,18 +128,16 @@ class ImageSubscriber(Node):
             prev_points_2d.append([zc_prev, x_prev])   # P
             curr_points_2d.append([zc_curr, x_curr])   # Q
 
-            prev_points_3d.append([zc_prev, x_prev, y_prev])
-            curr_points_3d.append([zc_curr, x_curr, y_curr])
+            prev_points_3d.append([zc_prev, x_prev, y_prev])######################
+            curr_points_3d.append([zc_curr, x_curr, y_curr])#####################
 
             # Visualisierung
             cv2.circle(img_out, (u_ci, v_ci), 2, (0, 255, 0), -1)
-            cv2.circle(img_out, (u_pi, v_pi), 2, (0, 0, 255), -1)
-            cv2.line(img_out, (u_ci, v_ci), (u_pi, v_pi), (255, 0, 0), 1)
+
 
         if len(prev_points_2d) < 4:
             self.prev_gray = gray.copy()
             self.prev_depth_img = self.depth_img.copy()
-            self.get_logger().warn("Zu wenige gültige 3D-Korrespondenzen.")
             cv2.imshow("Matches", img_out)
             cv2.waitKey(1)
             return
@@ -176,17 +158,12 @@ class ImageSubscriber(Node):
         if theta_pc is None:
             self.prev_gray = gray.copy()
             self.prev_depth_img = self.depth_img.copy()
-            self.get_logger().warn("RANSAC konnte keine gültige Transformation bestimmen.")
             cv2.imshow("Matches", img_out)
             cv2.waitKey(1)
             return
 
-        # Punktwolken-Transformation: P = R * Q + t
-        # Das ist die Bewegung der Punktwolke im Roboterframe.
-        # Für Roboterbewegung brauchen wir die inverse Transformation.
         R_pc = self.rotation_matrix_2d(theta_pc)
 
-        R_robot = R_pc.T
         t_robot = -R_pc.T @ t_pc
         theta_robot = -theta_pc
 
@@ -201,10 +178,9 @@ class ImageSubscriber(Node):
         self.robot_x += delta_world[0]
         self.robot_y += delta_world[1]
 
-        inlier_count = int(np.sum(inlier_mask))
 
         #Debug ausgabe
-        self.get_logger().info(f"Pose → x: {self.robot_x:.2f}, y: {self.robot_y:.2f}, theta: {math.degrees(self.robot_theta):.1f}°")
+        self.get_logger().info(f"x: {self.robot_x:.2f}, y: {self.robot_y:.2f}, theta: {math.degrees(self.robot_theta):.1f}°")
 
         # Aktuelle Punktwolke ins alte System transformieren
         curr_points_aligned = []
@@ -240,37 +216,6 @@ class ImageSubscriber(Node):
         self.prev_gray = gray.copy()
         self.prev_depth_img = self.depth_img.copy()
 
-    def is_valid_depth(self, d):
-        if d is None:
-            return False
-        if np.isnan(d):
-            return False
-        if np.isinf(d):
-            return False
-        if d <= 0:
-            return False
-        return True
-
-    def is_depth_locally_stable(self, depth_img, u, v, patch_size=3, max_std=0.03):
-        half = patch_size // 2
-
-        if (
-            u - half < 0 or v - half < 0 or
-            u + half >= depth_img.shape[1] or
-            v + half >= depth_img.shape[0]
-        ):
-            return False
-
-        patch = depth_img[v-half:v+half+1, u-half:u+half+1].astype(np.float32)
-        patch = patch / 1000.0
-
-        valid = np.isfinite(patch) & (patch > 0.0)
-        vals = patch[valid]
-
-        if len(vals) < 5:
-            return False
-
-        return np.std(vals) < max_std
 
     def rotation_matrix_2d(self, theta):
         c = math.cos(theta)
@@ -278,12 +223,6 @@ class ImageSubscriber(Node):
         return np.array([[c, -s], [s, c]], dtype=np.float64)
 
     def estimate_kabsch_2d(self, P, Q):
-        """
-        Schätzt Rotation und Translation mit der 2D-Kabsch-Vereinfachung.
-        Gesucht: P ≈ R * Q + t
-        P: vorherige Punkte (N x 2)
-        Q: aktuelle Punkte  (N x 2)
-        """
         if len(P) < 2 or len(Q) < 2:
             return None, None
 
@@ -309,30 +248,16 @@ class ImageSubscriber(Node):
 
         return theta, t
 
-    def compute_errors(self, P, Q, theta, t):
-        R = self.rotation_matrix_2d(theta)
-        Q_transformed = (R @ Q.T).T + t
-        errors = np.linalg.norm(P - Q_transformed, axis=1)
-        return errors
 
     def ransac_kabsch_2d(self, P, Q, iterations=100, threshold=0.08):
-        """
-        Einfache RANSAC-Version.
-        P ≈ R * Q + t
-        """
-        n = len(P)
-        if n < 2:
-            return None, None, None
-
+        
         best_inlier_mask = None
         best_inlier_count = 0
-        best_theta = None
-        best_t = None
+        
+        i = list(range(len(P)))
 
-        indices = list(range(n))
-
-        for _ in range(iterations):
-            sample_idx = random.sample(indices, 2)
+        for n in range(iterations):
+            sample_idx = random.sample(i, 2)
 
             P_sample = P[sample_idx]
             Q_sample = Q[sample_idx]
@@ -341,20 +266,21 @@ class ImageSubscriber(Node):
             if theta is None:
                 continue
 
-            errors = self.compute_errors(P, Q, theta, t)
+            R = self.rotation_matrix_2d(theta)
+            errors = np.linalg.norm(P - ((R @ Q.T).T + t), axis=1)
+
             inlier_mask = errors < threshold
             inlier_count = int(np.sum(inlier_mask))
 
             if inlier_count > best_inlier_count:
                 best_inlier_count = inlier_count
                 best_inlier_mask = inlier_mask
-                best_theta = theta
-                best_t = t
+        
 
         if best_inlier_mask is None or best_inlier_count < 3:
             return None, None, None
 
-        # Mit allen Inliers nochmal sauber schätzen
+        # Mit allen Inliers nochmal schätzen
         P_inliers = P[best_inlier_mask]
         Q_inliers = Q[best_inlier_mask]
 
