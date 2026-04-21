@@ -1,35 +1,53 @@
 #!/usr/bin/env python3
-import numpy as np
-import cv2
+import math
+import random
 
+import cv2
+import numpy as np
 import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
-from sklearn.cluster import DBSCAN
-from sensor_msgs.msg import PointCloud2
-from std_msgs.msg import Header
+from rclpy.node import Node
+from sensor_msgs.msg import Image, PointCloud2
 from sensor_msgs_py import point_cloud2
+from std_msgs.msg import Header
+
 
 class ImageSubscriber(Node):
     def __init__(self):
-        super().__init__('matcher_inkl_angels')
+        super().__init__('visual_odom')
+
         self.bridge = CvBridge()
-        # KameraParameter
+
+        # Kamera-Parameter
         self.cx = 318.525
         self.cy = 241.181
         self.fx = 526.61
         self.fy = 526.61
 
+        # Vorherige Fames
         self.prev_gray = None
+        self.prev_depth_img = None
+
+        # Aktuelles Depth Frame
         self.depth_img = None
 
-        self.orb = cv2.ORB_create(nfeatures=500)
+        # Geschätzte Roboter Pos
+        self.robot_x = 0.0
+        self.robot_y = 0.0
+        self.robot_theta = 0.0
+
+        # ORB + Matcher
+        self.orb = cv2.ORB_create(nfeatures=1000)
         self.bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-        
+
+        # Topics Subscriben
         self.subscription_rgb = self.create_subscription(Image,'/serf01/nav_rgbd_1/rgb/image_raw',self.rgb_callback,10)
         self.subscription_depth = self.create_subscription(Image,'/serf01/nav_rgbd_1/depth/image_raw',self.depth_callback,10)
-        self.pc_pub = self.create_publisher(PointCloud2,'/orb_feature_cloud',10)
+
+        # Ausgeben der Punktewolken
+        self.prev_point_cloud_publisher = self.create_publisher(PointCloud2, '/orb_feature_cloud_prev', 10)
+        self.current_point_cloud_publisher = self.create_publisher(PointCloud2, '/orb_feature_cloud_curr', 10)
+        self.current_point_cloud_trans = self.create_publisher(PointCloud2, '/orb_feature_cloud_curr_aligned', 10)
 
     def depth_callback(self, msg):
         self.depth_img = self.bridge.imgmsg_to_cv2(msg, 'passthrough')
@@ -38,84 +56,189 @@ class ImageSubscriber(Node):
         frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # Erstes Bild nur speichern
-        if self.prev_gray is None:
-            self.prev_gray = gray
-            return
-
+        # auf depth_img Warten
         if self.depth_img is None:
-            self.prev_gray = gray
             return
 
-        # ORB Features
-        kp1, des1 = self.orb.detectAndCompute(gray, None)
-        kp2, des2 = self.orb.detectAndCompute(self.prev_gray, None)
+        # Erstes Frame speichern
+        if self.prev_gray is None or self.prev_depth_img is None:
+            self.prev_gray = gray.copy()
+            self.prev_depth_img = self.depth_img.copy()
+            return
+
+        # Features berechnen
+        kp_curr, des_curr = self.orb.detectAndCompute(gray, None)
+        kp_prev, des_prev = self.orb.detectAndCompute(self.prev_gray, None)
+        if des_curr is None or des_prev is None:
+            return
 
         # Matching
-        matches = self.bf.match(des1, des2)
+        matches = self.bf.match(des_curr, des_prev)
+
+        # Abbrechen wenn weniger als 10 matches
+        if len(matches) < 10:
+            self.prev_gray = gray.copy()
+            self.prev_depth_img = self.depth_img.copy()
+            return
+
+        # Nur die besten 100?  Matches verwenden
         matches = sorted(matches, key=lambda x: x.distance)
+        best_matches = min(100, len(matches))
+        matches = matches[:best_matches]
 
-        h, w = self.depth_img.shape[:2]
+        # Korrespondierende 3D-Punkte aufbauen
+        prev_points_2d = []   # P vorherig
+        curr_points_2d = []   # Q aktuell
 
-        # gültige Punkte vor dem Zusammenfassen: (u, v, z)
-        valid_features = []
+        prev_points_3d = []
+        curr_points_3d = []
 
-        for m in matches:
-            kp = kp1[m.queryIdx]   # Punkt im aktuellen Bild
-            u, v = kp.pt
-            u_i, v_i = int(round(u)), int(round(v))
+        img_h = 480
+        img_w = 640
 
-            if not (0 <= u_i < w and 0 <= v_i < h):
-                continue
-
-            depth_raw = self.depth_img[v_i, u_i]
-
-            if not self.is_valid_depth(depth_raw):
-                continue
-
-            z = depth_raw / 1000.0
-
-            # sinnvoller Tiefenbereich
-            if z < 0.2 or z > 20.0:
-                continue
-
-            valid_features.append((u, v, z))
-
-        # Nahe Punkte zusammenfassen mit DBSCAN
-        merged_features = self.merge_close_points(valid_features, eps=8, min_samples=1)
-
-        xyz_points = []
-
-        for (u, v, z) in merged_features:
-            x_cam = z * (u - self.cx) / self.fx
-            y_cam = z * (v - self.cy) / self.fy
-            z_cam = z
-            xyz_points.append([float(z_cam), float(-x_cam), float(-y_cam)])
-
-        # Ausgabe-Bild
         img_out = frame.copy()
+#############################################################################################################################
+        for m in matches:
+            kp_c = kp_curr[m.queryIdx]   # aktuelles Bild
+            kp_p = kp_prev[m.trainIdx]   # vorheriges Bild
 
-        for (u, v, z) in merged_features:
-            u_i, v_i = int(round(u)), int(round(v))
+            u_c, v_c = kp_c.pt
+            u_p, v_p = kp_p.pt
 
-            # Punkt einzeichnen
-            cv2.circle(img_out, (u_i, v_i), 2, (0, 255, 0), -1)
+            u_ci, v_ci = int(round(u_c)), int(round(v_c))
+            u_pi, v_pi = int(round(u_p)), int(round(v_p))
 
-            # Tiefe daneben schreiben
-            cv2.putText(img_out,f"{z:.2f}",(u_i + 3, v_i),cv2.FONT_HERSHEY_SIMPLEX,0.3,(0, 255, 0),1)
+            if not (0 <= u_ci < img_w and 0 <= v_ci < img_h):
+                continue
+            if not (0 <= u_pi < img_w and 0 <= v_pi < img_h):
+                continue
 
-        cv2.imshow("Depth_interest Points", img_out)
+            d_curr = self.depth_img[v_ci, u_ci]
+            d_prev = self.prev_depth_img[v_pi, u_pi]
+
+            if not self.is_valid_depth(d_curr) or not self.is_valid_depth(d_prev):
+                continue
+
+            # optional: lokale Tiefenstabilität
+            if not self.is_depth_locally_stable(self.depth_img, u_ci, v_ci):
+                continue
+            if not self.is_depth_locally_stable(self.prev_depth_img, u_pi, v_pi):
+                continue
+
+            z_curr = float(d_curr) / 1000.0
+            z_prev = float(d_prev) / 1000.0
+
+            if not (0.2 <= z_curr <= 20.0 and 0.2 <= z_prev <= 20.0):
+                continue
+
+            # 3D-Punkte im Kamerakoordinatensystem
+            x_curr = -z_curr * (u_c - self.cx) / self.fx
+            y_curr = 0.0
+            zc_curr = z_curr
+
+            x_prev = -z_prev * (u_p - self.cx) / self.fx
+            y_prev = 0.0
+            zc_prev = z_prev
+
+            # 2D für Kabsch: Ebene = (z, x)
+            prev_points_2d.append([zc_prev, x_prev])   # P
+            curr_points_2d.append([zc_curr, x_curr])   # Q
+
+            prev_points_3d.append([zc_prev, x_prev, y_prev])
+            curr_points_3d.append([zc_curr, x_curr, y_curr])
+
+            # Visualisierung
+            cv2.circle(img_out, (u_ci, v_ci), 2, (0, 255, 0), -1)
+            cv2.circle(img_out, (u_pi, v_pi), 2, (0, 0, 255), -1)
+            cv2.line(img_out, (u_ci, v_ci), (u_pi, v_pi), (255, 0, 0), 1)
+
+        if len(prev_points_2d) < 4:
+            self.prev_gray = gray.copy()
+            self.prev_depth_img = self.depth_img.copy()
+            self.get_logger().warn("Zu wenige gültige 3D-Korrespondenzen.")
+            cv2.imshow("Matches", img_out)
+            cv2.waitKey(1)
+            return
+
+        prev_points_2d = np.array(prev_points_2d, dtype=np.float64)
+        curr_points_2d = np.array(curr_points_2d, dtype=np.float64)
+        prev_points_3d = np.array(prev_points_3d, dtype=np.float32)
+        curr_points_3d = np.array(curr_points_3d, dtype=np.float32)
+
+        # RANSAC + Kabsch
+        theta_pc, t_pc, inlier_mask = self.ransac_kabsch_2d(
+            prev_points_2d,
+            curr_points_2d,
+            iterations=120,
+            threshold=0.08
+        )
+
+        if theta_pc is None:
+            self.prev_gray = gray.copy()
+            self.prev_depth_img = self.depth_img.copy()
+            self.get_logger().warn("RANSAC konnte keine gültige Transformation bestimmen.")
+            cv2.imshow("Matches", img_out)
+            cv2.waitKey(1)
+            return
+
+        # Punktwolken-Transformation: P = R * Q + t
+        # Das ist die Bewegung der Punktwolke im Roboterframe.
+        # Für Roboterbewegung brauchen wir die inverse Transformation.
+        R_pc = self.rotation_matrix_2d(theta_pc)
+
+        R_robot = R_pc.T
+        t_robot = -R_pc.T @ t_pc
+        theta_robot = -theta_pc
+
+        # Pose integrieren
+        self.robot_theta += theta_robot
+
+        c = math.cos(self.robot_theta)
+        s = math.sin(self.robot_theta)
+        R_world = np.array([[c, -s], [s, c]], dtype=np.float64)
+
+        delta_world = R_world @ t_robot
+        self.robot_x += delta_world[0]
+        self.robot_y += delta_world[1]
+
+        inlier_count = int(np.sum(inlier_mask))
+
+        #Debug ausgabe
+        self.get_logger().info(f"Pose → x: {self.robot_x:.2f}, y: {self.robot_y:.2f}, theta: {math.degrees(self.robot_theta):.1f}°")
+
+        # Aktuelle Punktwolke ins alte System transformieren
+        curr_points_aligned = []
+        for q in curr_points_3d[inlier_mask]:
+            q2 = np.array([q[0], q[1]], dtype=np.float64)   # [z, x]
+            p_est = R_pc @ q2 + t_pc
+            curr_points_aligned.append([float(p_est[0]), float(p_est[1]), 0.0])
+
+        prev_points_inliers_3d = prev_points_3d[inlier_mask]
+        curr_points_inliers_3d = curr_points_3d[inlier_mask]
+
+        # Punktwolken publizieren
+        header = Header()
+        header.stamp = self.get_clock().now().to_msg()
+        header.frame_id = "kinect_depth"
+
+        if len(prev_points_inliers_3d) > 0:
+            msg_prev = point_cloud2.create_cloud_xyz32(header, prev_points_inliers_3d.tolist())
+            self.prev_point_cloud_publisher.publish(msg_prev)
+
+        if len(curr_points_inliers_3d) > 0:
+            msg_curr = point_cloud2.create_cloud_xyz32(header, curr_points_inliers_3d.tolist())
+            self.current_point_cloud_publisher.publish(msg_curr)
+
+        if len(curr_points_aligned) > 0:
+            msg_aligned = point_cloud2.create_cloud_xyz32(header, curr_points_aligned)
+            self.current_point_cloud_trans.publish(msg_aligned)
+
+        cv2.imshow("Matches", img_out)
         cv2.waitKey(1)
-        if xyz_points:
-            header = Header()
-            header.stamp = self.get_clock().now().to_msg()
-            header.frame_id = "kinect_depth"
 
-            cloud_msg = point_cloud2.create_cloud_xyz32(header, xyz_points)
-            self.pc_pub.publish(cloud_msg)
-            
-        # aktuelles Bild als vorheriges speichern
-        self.prev_gray = gray
+        # Aktuelles Frame wird vorheriges Frame
+        self.prev_gray = gray.copy()
+        self.prev_depth_img = self.depth_img.copy()
 
     def is_valid_depth(self, d):
         if d is None:
@@ -128,17 +251,18 @@ class ImageSubscriber(Node):
             return False
         return True
 
-    def is_depth_locally_stable(self, u, v, patch_size=3, max_std=0.03):
+    def is_depth_locally_stable(self, depth_img, u, v, patch_size=3, max_std=0.03):
         half = patch_size // 2
 
-        if (u - half < 0 or v - half < 0 or
-                u + half >= self.depth_img.shape[1] or
-                v + half >= self.depth_img.shape[0]):
+        if (
+            u - half < 0 or v - half < 0 or
+            u + half >= depth_img.shape[1] or
+            v + half >= depth_img.shape[0]
+        ):
             return False
 
-        patch = self.depth_img[v-half:v+half+1, u-half:u+half+1].astype(np.float32)
-
-        patch = patch/1000.0
+        patch = depth_img[v-half:v+half+1, u-half:u+half+1].astype(np.float32)
+        patch = patch / 1000.0
 
         valid = np.isfinite(patch) & (patch > 0.0)
         vals = patch[valid]
@@ -148,28 +272,97 @@ class ImageSubscriber(Node):
 
         return np.std(vals) < max_std
 
-    def merge_close_points(self, valid_features, eps=8, min_samples=1):
-        if not valid_features:
-            return []
+    def rotation_matrix_2d(self, theta):
+        c = math.cos(theta)
+        s = math.sin(theta)
+        return np.array([[c, -s], [s, c]], dtype=np.float64)
 
-        uv = np.array([[p[0], p[1]] for p in valid_features], dtype=np.float32)
+    def estimate_kabsch_2d(self, P, Q):
+        """
+        Schätzt Rotation und Translation mit der 2D-Kabsch-Vereinfachung.
+        Gesucht: P ≈ R * Q + t
+        P: vorherige Punkte (N x 2)
+        Q: aktuelle Punkte  (N x 2)
+        """
+        if len(P) < 2 or len(Q) < 2:
+            return None, None
 
-        clustering = DBSCAN(eps=eps, min_samples=min_samples)
-        labels = clustering.fit_predict(uv)
+        P_mean = np.mean(P, axis=0)
+        Q_mean = np.mean(Q, axis=0)
 
-        merged = []
-        unique_labels = set(labels)
+        P_centered = P - P_mean
+        Q_centered = Q - Q_mean
 
-        for label in unique_labels:
-            cluster_points = [valid_features[i] for i in range(len(valid_features)) if labels[i] == label]
+        sum1 = 0.0
+        sum2 = 0.0
 
-            u_mean = float(np.mean([p[0] for p in cluster_points]))
-            v_mean = float(np.mean([p[1] for p in cluster_points]))
-            z_mean = float(np.mean([p[2] for p in cluster_points]))
+        for i in range(len(P)):
+            p_x, p_y = P_centered[i]
+            q_x, q_y = Q_centered[i]
 
-            merged.append((u_mean, v_mean, z_mean))
+            sum1 += q_x * p_y - q_y * p_x
+            sum2 += q_x * p_x + q_y * p_y
 
-        return merged
+        theta = math.atan2(sum1, sum2)
+        R = self.rotation_matrix_2d(theta)
+        t = P_mean - R @ Q_mean
+
+        return theta, t
+
+    def compute_errors(self, P, Q, theta, t):
+        R = self.rotation_matrix_2d(theta)
+        Q_transformed = (R @ Q.T).T + t
+        errors = np.linalg.norm(P - Q_transformed, axis=1)
+        return errors
+
+    def ransac_kabsch_2d(self, P, Q, iterations=100, threshold=0.08):
+        """
+        Einfache RANSAC-Version.
+        P ≈ R * Q + t
+        """
+        n = len(P)
+        if n < 2:
+            return None, None, None
+
+        best_inlier_mask = None
+        best_inlier_count = 0
+        best_theta = None
+        best_t = None
+
+        indices = list(range(n))
+
+        for _ in range(iterations):
+            sample_idx = random.sample(indices, 2)
+
+            P_sample = P[sample_idx]
+            Q_sample = Q[sample_idx]
+
+            theta, t = self.estimate_kabsch_2d(P_sample, Q_sample)
+            if theta is None:
+                continue
+
+            errors = self.compute_errors(P, Q, theta, t)
+            inlier_mask = errors < threshold
+            inlier_count = int(np.sum(inlier_mask))
+
+            if inlier_count > best_inlier_count:
+                best_inlier_count = inlier_count
+                best_inlier_mask = inlier_mask
+                best_theta = theta
+                best_t = t
+
+        if best_inlier_mask is None or best_inlier_count < 3:
+            return None, None, None
+
+        # Mit allen Inliers nochmal sauber schätzen
+        P_inliers = P[best_inlier_mask]
+        Q_inliers = Q[best_inlier_mask]
+
+        theta_refined, t_refined = self.estimate_kabsch_2d(P_inliers, Q_inliers)
+        if theta_refined is None:
+            return None, None, None
+
+        return theta_refined, t_refined, best_inlier_mask
 
 
 def main():
@@ -178,6 +371,7 @@ def main():
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
+
 
 if __name__ == "__main__":
     main()

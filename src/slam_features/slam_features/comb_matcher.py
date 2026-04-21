@@ -7,7 +7,6 @@ from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 from sklearn.cluster import DBSCAN
 
-
 class ImageSubscriber(Node):
     def __init__(self):
         super().__init__('matcher_inkl_angels')
@@ -15,7 +14,7 @@ class ImageSubscriber(Node):
 
         self.prev_gray = None
         self.depth_img = None
-
+        
         self.orb = cv2.ORB_create(nfeatures=500)
         self.bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
         
@@ -38,7 +37,7 @@ class ImageSubscriber(Node):
         if self.depth_img is None:
             self.prev_gray = gray
             return
-        
+
         # ORB Features
         kp1, des1 = self.orb.detectAndCompute(gray, None)
         kp2, des2 = self.orb.detectAndCompute(self.prev_gray, None)
