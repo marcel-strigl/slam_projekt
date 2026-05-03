@@ -223,7 +223,6 @@ class ImageSubscriber(Node):
             msg_curr = point_cloud2.create_cloud_xyz32(header, curr_points_inliers_3d.tolist())
             self.current_point_cloud_publisher.publish(msg_curr)
 
-
         cv2.imshow("Matches", img_out)
         cv2.waitKey(1)
 
