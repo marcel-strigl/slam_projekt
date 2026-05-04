@@ -32,7 +32,7 @@ class ImageSubscriber(Node):
         self.real_y = 0.0
         self.trans_x = 0.0
         self.trans_y = 0.0
-        self.vektor = []
+        self.vektor = np.array([0.0, 0.0], dtype=np.float64)
 
         # Vorherige Fames
         self.prev_gray = None
@@ -53,15 +53,15 @@ class ImageSubscriber(Node):
         # Topics Subscriben
         self.subscription_rgb = self.create_subscription(Image,'/serf01/nav_rgbd_1/rgb/image_raw',self.rgb_callback,10)
         self.subscription_depth = self.create_subscription(Image,'/serf01/nav_rgbd_1/depth/image_raw',self.depth_callback,10)
-        self.subscription_wheel_odom = self.create_subscription(Odometry,'/wheel_odom/pose',self.odom_callback,10)
+        self.subscription_wheel_odom = self.create_subscription(Odometry,'/wheel_odom',self.odom_callback,10)
 
         # Ausgeben der Punktewolken
         self.prev_point_cloud_publisher = self.create_publisher(PointCloud2, '/orb_feature_cloud_prev', 10)
         self.current_point_cloud_publisher = self.create_publisher(PointCloud2, '/orb_feature_cloud_curr', 10)
 
     def odom_callback(self, msg):
-        self.real_x = msg.pose.position.x
-        self.real_y = msg.pose.position.y
+        self.real_x = msg.pose.pose.position.x
+        self.real_y = msg.pose.pose.position.y
 
         if self.trans_x == 0.0 and self.trans_y == 0.0:
             self.trans_x = self.real_x
@@ -70,10 +70,7 @@ class ImageSubscriber(Node):
         dx = self.real_x - self.trans_x
         dy = self.real_y - self.trans_y
 
-        R = self.rotation_matrix_2d(math.pi / 4)
-
         self.vektor = np.array([dx, dy], dtype=np.float64)
-        self.vektor = R @ self.vektor
 
     def depth_callback(self, msg):
         self.depth_img = self.bridge.imgmsg_to_cv2(msg, 'passthrough')/1000.0
@@ -194,8 +191,8 @@ class ImageSubscriber(Node):
 
         # Pose integrieren
         self.robot_theta += theta_robot
-        c = math.cos(self.robot_theta + 3.14)
-        s = math.sin(self.robot_theta + 3.14)
+        c = math.cos(self.robot_theta)
+        s = math.sin(self.robot_theta)
         R_world = np.array([[c, -s], [s, c]], dtype=np.float64)
 
         delta_world = R_world @ t_robot
@@ -205,7 +202,11 @@ class ImageSubscriber(Node):
         #Debug ausgabe
         self.get_logger().info(f"-: {self.robot_x:.2f}, y: {self.robot_y:.2f}, theta: {math.degrees(self.robot_theta):.1f}°")
 
-        print("X: ", self.vektor[0], "      Y: ", self.vektor[1])
+        print(
+        "Visual X:", self.robot_x,
+         "Visual Y:", self.robot_y,
+          "| Wheel X:", self.vektor[0],
+         "Wheel Y:", self.vektor[1])
 
         prev_points_inliers_3d = prev_points_3d[inlier_mask]
         curr_points_inliers_3d = curr_points_3d[inlier_mask]
@@ -213,10 +214,10 @@ class ImageSubscriber(Node):
         # Punktwolken publizieren
         header = Header()
         header.stamp = self.get_clock().now().to_msg()
-        header.frame_id = "kinect_depth"
+        header.frame_id = "wheel_odom"
 
         if len(prev_points_inliers_3d) > 0:
-            msg_prev = point_cloud2.create_cloud_xyz32(header, curr_points_3d.tolist())
+            msg_prev = point_cloud2.create_cloud_xyz32(header, prev_points_inliers_3d.tolist())
             self.prev_point_cloud_publisher.publish(msg_prev)
 
         if len(curr_points_inliers_3d) > 0:
