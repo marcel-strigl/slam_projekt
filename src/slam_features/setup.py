@@ -30,7 +30,10 @@ setup(
         'comb_matcher = slam_features.comb_matcher:main',
         'PointCloud = slam_features.PointCloud:main',
         'ORB_finder = slam_features.ORB_finder:main',
-        'kabsch = slam_features.kabsch:main'
+        '05_Kabsch= slam_features.05_Kabsch:main',
+        'Kalman_Lin= slam_features.Kalman_Lin:main',
+        'EKF= slam_features.EKF:main'
+
         ],
     }
 )
